@@ -3,7 +3,11 @@ name: Publish Docker Image
 on:
   release:
     types: [published]
-  # Publish without cutting a release: Actions → Publish Docker Image → Run workflow
+  # Publish straight from a version tag: git tag v0.3.0 && git push origin v0.3.0
+  push:
+    tags:
+      - "v*.*.*"
+  # Publish without a release or tag: Actions → Publish Docker Image → Run workflow
   workflow_dispatch:
     inputs:
       tag:
