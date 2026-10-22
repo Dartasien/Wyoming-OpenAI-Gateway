@@ -35,6 +35,42 @@ def _get_log_level(key: str, default: str = "INFO") -> str:
     return level if level in valid else default
 
 
+def normalize_prefix(prefix: str | None) -> str:
+    """Normalize an API prefix to '' or '/segment' with no trailing slash.
+
+    ``/v1`` -> ``/v1``, ``v1`` -> ``/v1``, ``/`` and empty -> ``''`` (routes at the root).
+    """
+    if not prefix:
+        return ""
+    cleaned = prefix.strip()
+    if not cleaned.startswith("/"):
+        cleaned = "/" + cleaned
+    return cleaned.rstrip("/")
+
+
+def route_prefixes(primary: str) -> tuple[str, ...]:
+    """Every prefix the OpenAI-compatible routes are served under.
+
+    OpenAI-compatible clients (Open Notebook via esperanto, the ``openai`` SDK,
+    curl) append ``/models``, ``/audio/speech``, ``/audio/transcriptions`` to the
+    base URL the user typed — they never add ``/v1`` themselves. Mounting the
+    routes under the configured prefix, the canonical ``/v1`` **and** the root
+    means any of these work as a base URL:
+
+        http://host:8555      http://host:8555/      http://host:8555/v1
+    """
+    prefixes: dict[str, None] = {}
+    for candidate in (primary, "/v1", ""):
+        prefixes.setdefault(candidate, None)
+    return tuple(prefixes)
+
+
+def openai_base_urls(host: str, port: int, prefixes: tuple[str, ...]) -> list[str]:
+    """Base URLs a client can be pointed at, for startup logging."""
+    display_host = "localhost" if host in ("0.0.0.0", "::", "") else host
+    return [f"http://{display_host}:{port}{prefix}" for prefix in prefixes]
+
+
 def validate(settings: Settings) -> list[str]:
     """Validate settings and return a list of error messages (empty = valid)."""
     errors: list[str] = []
@@ -82,6 +118,8 @@ class Settings:
     debug: bool = False
     log_level: str = "INFO"
     prefix: str = "/v1"
+    voice_fallback: bool = True
+    ffmpeg_fallback: bool = True
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -107,5 +145,7 @@ class Settings:
             port=_get_int("PORT", 8555),
             debug=_get_bool("DEBUG", False),
             log_level=_get_log_level("LOG_LEVEL", "INFO"),
-            prefix=os.environ.get("PREFIX", "/v1"),
+            prefix=normalize_prefix(os.environ.get("PREFIX", "/v1")),
+            voice_fallback=_get_bool("VOICE_FALLBACK", True),
+            ffmpeg_fallback=_get_bool("FFMPEG_FALLBACK", True),
         )

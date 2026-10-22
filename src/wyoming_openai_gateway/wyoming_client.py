@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import math
 from collections.abc import AsyncGenerator
 
 from wyoming.asr import Transcribe, Transcript
@@ -66,16 +68,28 @@ class WyomingStreamClient:
         return Info.from_event(event)
 
     async def synthesize_stream(
-        self, text: str, voice: str, speed: float = 1.0
+        self, text: str, voice: str | None, speed: float = 1.0
     ) -> AsyncGenerator[Event, None]:
-        """Send a Synthesize request and yield Wyoming events as they arrive."""
+        """Send a Synthesize request and yield Wyoming events as they arrive.
+
+        ``voice=None`` (or blank) omits the voice from the event, which tells the
+        Wyoming server to use its own default voice.
+        """
         if self._client is None:
             raise WyomingConnectionError("Not connected to Wyoming server")
 
-        voice_opts = SynthesizeVoice(name=voice.strip())
-        synthesize_event = Synthesize(text=text, voice=voice_opts)
-        if speed is not None:
-            synthesize_event.speech_rate = speed
+        synthesize_event = Synthesize(text=text)
+        if voice and voice.strip():
+            synthesize_event.voice = SynthesizeVoice(name=voice.strip())
+        if speed is not None and not math.isclose(speed, 1.0):
+            if "speech_rate" in {f.name for f in dataclasses.fields(Synthesize)}:
+                synthesize_event.speech_rate = speed  # newer wyoming releases
+            else:
+                log.warning(
+                    "speed=%s cannot be forwarded — wyoming's Synthesize event has no "
+                    "speech-rate field, so the server's configured rate is used",
+                    speed,
+                )
 
         try:
             await self._client.write_event(synthesize_event.event())
@@ -90,7 +104,7 @@ class WyomingStreamClient:
             raise WyomingProtocolError(f"Error during Wyoming synthesize stream: {e}") from e
 
     async def synthesize_complete(
-        self, text: str, voice: str, speed: float = 1.0
+        self, text: str, voice: str | None, speed: float = 1.0
     ) -> tuple[dict, bytes]:
         """Send a Synthesize request and collect all audio data.
 

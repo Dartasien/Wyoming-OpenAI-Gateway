@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install hatchling
-          pip install -e ".[test]"
+          pip install -e ".[test,mp3]"
       - name: Lint with ruff
         run: ruff check src/ tests/
       - name: Test with pytest

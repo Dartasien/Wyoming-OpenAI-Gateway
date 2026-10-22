@@ -5,10 +5,11 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import PlainTextResponse
 
 from . import __version__
-from .config import Settings
+from .config import Settings, normalize_prefix, openai_base_urls, route_prefixes
 from .errors import WyomingConnectionError
 from .gateway import OpenAIGateway
 from .openai_models import (
@@ -26,53 +27,49 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings = Settings._parse()
 
     gateway = OpenAIGateway(settings)
+    prefix = normalize_prefix(settings.prefix)
+    prefixes = route_prefixes(prefix)
+
+    def configured_services() -> dict[str, tuple[str, int]]:
+        services: dict[str, tuple[str, int]] = {}
+        if settings.tts_host and settings.tts_port:
+            services["tts"] = (settings.tts_host, settings.tts_port)
+        if settings.stt_host and settings.stt_port:
+            services["stt"] = (settings.stt_host, settings.stt_port)
+        return services
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        services = []
-        if settings.tts_host and settings.tts_port:
-            services.append(f"TTS at {settings.tts_host}:{settings.tts_port}")
-        if settings.stt_host and settings.stt_port:
-            services.append(f"STT at {settings.stt_host}:{settings.stt_port}")
+        services = configured_services()
+        base_urls = openai_base_urls(settings.host, settings.port, prefixes)
 
         log.info(
             "Starting Wyoming-OpenAI-Gateway v%s — Services: %s",
             __version__,
-            ", ".join(services) if services else "none configured",
+            ", ".join(f"{name} at {host}:{port}" for name, (host, port) in services.items())
+            or "none configured",
         )
+        log.info("OpenAI-compatible base URLs: %s", ", ".join(base_urls))
 
-        # Validate TTS connectivity on startup (non-fatal)
-        if settings.tts_host and settings.tts_port:
+        # Validate connectivity on startup (non-fatal)
+        for name, (host, port) in services.items():
             try:
-                async with WyomingStreamClient(settings.tts_host, settings.tts_port) as client:
+                async with WyomingStreamClient(host, port) as client:
                     await client.describe()
-                log.info("TTS server at %s:%s is reachable", settings.tts_host, settings.tts_port)
+                log.info("%s server at %s:%s is reachable", name.upper(), host, port)
             except WyomingConnectionError:
                 log.warning(
-                    "TTS server at %s:%s is unreachable — will retry on each request",
-                    settings.tts_host,
-                    settings.tts_port,
+                    "%s server at %s:%s is unreachable — will retry on each request",
+                    name.upper(),
+                    host,
+                    port,
                 )
             except Exception:
-                log.warning("Unexpected error during TTS connectivity check", exc_info=True)
-        else:
+                log.warning("Unexpected error during %s connectivity check", name.upper(), exc_info=True)
+
+        if "tts" not in services:
             log.info("TTS is disabled")
-
-        # Validate STT connectivity on startup (non-fatal)
-        if settings.stt_host and settings.stt_port:
-            try:
-                async with WyomingStreamClient(settings.stt_host, settings.stt_port) as client:
-                    await client.describe()
-                log.info("STT server at %s:%s is reachable", settings.stt_host, settings.stt_port)
-            except WyomingConnectionError:
-                log.warning(
-                    "STT server at %s:%s is unreachable — will retry on each request",
-                    settings.stt_host,
-                    settings.stt_port,
-                )
-            except Exception:
-                log.warning("Unexpected error during STT connectivity check", exc_info=True)
-        else:
+        if "stt" not in services:
             log.info("STT is disabled")
 
         yield
@@ -85,38 +82,54 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
-    prefix = settings.prefix
-
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok", "version": __version__}
 
     @app.get("/readyz")
     async def readyz():
-        try:
-            async with WyomingStreamClient(settings.tts_host, settings.tts_port) as client:
-                await client.describe()
-            return {"status": "ready"}
-        except WyomingConnectionError as e:
-            raise HTTPException(status_code=503, detail=str(e))
+        services = configured_services()
+        if not services:
+            raise HTTPException(status_code=503, detail="No Wyoming services configured")
 
-    @app.get(f"{prefix}/voices")
+        for name, (host, port) in services.items():
+            try:
+                async with WyomingStreamClient(host, port) as client:
+                    await client.describe()
+            except WyomingConnectionError as e:
+                raise HTTPException(status_code=503, detail=f"{name.upper()} not ready: {e}") from e
+
+        return {"status": "ready", "services": sorted(services)}
+
+    # --- OpenAI-compatible routes ---
+
+    api = APIRouter()
+
+    @api.get("/models")
+    async def list_models():
+        """Model listing every OpenAI-compatible client probes before use.
+
+        Open Notebook's "Test connection" and "Discover Models" both call
+        GET {base_url}/models, so without this endpoint those requests 404.
+        """
+        return await gateway.list_models()
+
+    @api.get("/voices")
+    @api.get("/audio/voices")
     async def list_voices():
         return await gateway.list_voices()
 
-    @app.post(f"{prefix}/audio/speech")
+    @api.post("/audio/speech")
     async def text_to_speech(request: SpeechRequest):
         return await gateway.text_to_speech(request)
 
-    # --- STT Routes ---
-
-    @app.post(f"{prefix}/audio/transcriptions")
+    @api.post("/audio/transcriptions")
     async def create_transcription(
         file: UploadFile = File(..., description="Audio file to transcribe"),
         model: str = Form("whisper-1", description="Model identifier"),
         language: str | None = Form(None, description="Language code (e.g. 'en')"),
         prompt: str | None = Form(None, description="Optional context prompt"),
-        response_format: str = Form("json", description="Response format (json/text)"),
+        response_format: str = Form("json", description="Response format (json/text/verbose_json)"),
         temperature: float = Form(0.0, description="Sampling temperature"),
     ):
         request = TranscriptionRequest(
@@ -127,9 +140,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             temperature=temperature,
         )
         result = await gateway.transcribe_audio(file, request, is_translation=False)
+        if response_format.strip().lower() == "text":
+            return PlainTextResponse(result.text, media_type="text/plain")
         return result
 
-    @app.post(f"{prefix}/audio/translations")
+    @api.post("/audio/translations")
     async def create_translation(
         file: UploadFile = File(..., description="Audio file to translate"),
         model: str = Form("whisper-1", description="Model identifier"),
@@ -146,6 +161,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             temperature=temperature,
         )
         result = await gateway.transcribe_audio(file, request, is_translation=True)
+        if response_format.strip().lower() == "text":
+            return PlainTextResponse(result.text, media_type="text/plain")
         return result
+
+    # The same routes are served under the configured prefix, /v1 and the root:
+    # clients append /models, /audio/speech and /audio/transcriptions to whatever
+    # base URL they were given and never add /v1 themselves, so http://host:PORT,
+    # http://host:PORT/ and http://host:PORT/v1 must all work as a base URL.
+    for candidate in prefixes:
+        app.include_router(api, prefix=candidate, include_in_schema=(candidate == prefix))
+
+    @app.get("/")
+    async def index():
+        """Pointer at the OpenAI-compatible base URLs, so a 404 in the browser
+        is never the only thing a user sees."""
+        return {
+            "name": "Wyoming-OpenAI-Gateway",
+            "version": __version__,
+            "openai_base_urls": openai_base_urls(settings.host, settings.port, prefixes),
+            "docs": "/docs",
+            "health": "/healthz",
+        }
 
     return app

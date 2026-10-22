@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import AsyncGenerator
 
-import miniaudio
 from fastapi import HTTPException, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 
-from .audio_utils import assemble_wav, create_wav_header
+from .audio_utils import (
+    MP3_FORMATS,
+    PCM_FORMATS,
+    assemble_wav,
+    create_wav_header,
+    decode_to_pcm,
+    encode_mp3,
+)
 from .config import Settings
-from .errors import WyomingConnectionError, WyomingProtocolError
+from .errors import AudioGenerationError, WyomingConnectionError, WyomingProtocolError
 from .openai_models import (
+    ModelInfo,
+    ModelsResponse,
     SpeechRequest,
     TranscriptionRequest,
     TranscriptionResponse,
@@ -26,47 +35,25 @@ from .wyoming_client import WyomingStreamClient
 log = logging.getLogger(__name__)
 
 
-WYOMING_TARGET_RATE = 16000
-WYOMING_TARGET_WIDTH = 2
-WYOMING_TARGET_CHANNELS = 1
+# Model ids advertised by GET /models. Open Notebook (and esperanto's discovery)
+# classify a model's modality from its name: "tts" -> text_to_speech and
+# "whisper" -> speech_to_text, so these ids are chosen to be sorted correctly.
+TTS_MODEL_ID = "wyoming-tts"
+STT_MODEL_ID = "whisper-1"
 
 
-def _pcm_from_upload(
-    file: UploadFile,
-) -> tuple[bytes, int, int, int]:
-    """Decode uploaded audio to raw PCM via miniaudio.
-
-    Returns (pcm_bytes, rate, width, channels).
-
-    Supports WAV, MP3, FLAC, and other formats miniaudio can decode.
-    """
+def _read_upload(file: UploadFile) -> bytes:
+    """Read an uploaded file into memory (size-capped by the caller's proxy)."""
     raw = file.file.read()
-
     if not raw:
-        log.warning("Uploaded file is empty")
-        return b"", WYOMING_TARGET_RATE, WYOMING_TARGET_WIDTH, WYOMING_TARGET_CHANNELS
+        raise HTTPException(status_code=400, detail="No audio data received")
+    return raw
 
-    try:
-        result = miniaudio.decode(
-            raw,
-            output_format=miniaudio.SampleFormat.SIGNED16,
-        )
-        # result: DecodeResult with .samples (array('h')), .sample_rate, .nchannels
-        pcm = result.samples.tobytes()
-        log.debug(
-            "Decoded %s: %d Hz, 16-bit, %d ch, %d PCM bytes",
-            file.filename or "audio",
-            result.sample_rate,
-            result.nchannels,
-            len(pcm),
-        )
-        # Return native sample rate — the Wyoming server handles resampling
-        return pcm, result.sample_rate, WYOMING_TARGET_WIDTH, result.nchannels
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported audio format or corrupt file: {e}",
-        )
+
+def _filename_suffix(filename: str | None) -> str:
+    """Upload extension, e.g. '.m4a'. Only used to help ffmpeg pick a demuxer."""
+    match = re.search(r"\.([A-Za-z0-9]{1,8})$", filename or "")
+    return match.group(0) if match else ""
 
 
 class OpenAIGateway:
@@ -96,7 +83,9 @@ class OpenAIGateway:
                         Voice(
                             id=voice.name,
                             name=voice.description or voice.name,
-                            description=str(voice.attribution) if voice.attribution else None,
+                            description=(
+                                voice.attribution.name if voice.attribution else None
+                            ),
                             languages=voice.languages,
                         )
                     )
@@ -105,14 +94,127 @@ class OpenAIGateway:
             return VoicesResponse(voices=[])
         return VoicesResponse(voices=voices)
 
-    async def list_models(self) -> list[dict]:
-        """List available models based on configured services."""
-        models = []
+    async def list_models(self) -> ModelsResponse:
+        """List available models in the shape OpenAI clients expect from GET /models.
+
+        Open Notebook's connection test and "Discover Models" both call this and
+        sort models into the text-to-speech / speech-to-text slots by id, so one
+        id per configured service is exposed instead of one per voice (voices are
+        selected separately, through the client's Voice ID field).
+        """
+        data: list[ModelInfo] = []
         if self._settings.tts_host and self._settings.tts_port:
-            models.append({"id": "wyoming-tts", "object": "model", "created": 0, "owned_by": "wyoming"})
+            data.append(
+                ModelInfo(
+                    id=TTS_MODEL_ID,
+                    owned_by=f"wyoming:{self._settings.tts_host}:{self._settings.tts_port}",
+                    capability="tts",
+                )
+            )
         if self._settings.stt_host and self._settings.stt_port:
-            models.append({"id": "whisper-1", "object": "model", "created": 0, "owned_by": "wyoming"})
-        return models
+            data.append(
+                ModelInfo(
+                    id=STT_MODEL_ID,
+                    owned_by=f"wyoming:{self._settings.stt_host}:{self._settings.stt_port}",
+                    capability="stt",
+                )
+            )
+        return ModelsResponse(object="list", data=data)
+
+    async def _resolve_voice(self, client: WyomingStreamClient, requested: str | None) -> str | None:
+        """Map a requested voice onto one the Wyoming TTS server actually has.
+
+        OpenAI clients send OpenAI voice names ("alloy", "nova") while a Wyoming
+        server knows its own ids ("en_US-lessac-medium"). Forwarding an unknown
+        name is not harmless — wyoming-piper treats it as a voice to download and
+        the synthesis fails — so an unknown name is replaced by the first
+        installed voice. No voice at all means "use the server's own default".
+        """
+        if not requested:
+            return None
+        if not self._settings.voice_fallback:
+            return requested
+
+        try:
+            info = await client.describe()
+        except (WyomingConnectionError, WyomingProtocolError) as e:
+            log.debug("Could not describe TTS server to resolve voice: %s", e)
+            return requested
+
+        installed = [
+            voice.name
+            for program in info.tts
+            if program.installed
+            for voice in (program.voices or [])
+            if voice.name and voice.installed
+        ]
+        if not installed:
+            log.debug("TTS server reported no voices — passing '%s' through", requested)
+            return requested
+
+        if requested in installed:
+            return requested
+
+        if requested:
+            log.warning(
+                "Voice '%s' is not installed on the Wyoming TTS server — using '%s' (available: %s)",
+                requested,
+                installed[0],
+                ", ".join(installed),
+            )
+        return installed[0]
+
+    def _audio_response(self, pcm: bytes, audio_params: dict, request: SpeechRequest) -> Response:
+        """Wrap Wyoming's PCM in the container the client asked for.
+
+        WAV is native and always available. MP3 needs the optional ``[mp3]``
+        dependency; when it is missing the WAV bytes are returned anyway, which
+        keeps clients like Open Notebook working (they sniff the audio). PCM is
+        handed back raw.
+        """
+        fmt = (request.response_format or "wav").strip().lower()
+        rate, width, channels = audio_params["rate"], audio_params["width"], audio_params["channels"]
+
+        if fmt in PCM_FORMATS:
+            log.info("Generated %.1f KB of raw PCM audio for voice '%s'", len(pcm) / 1024, request.voice)
+            return Response(content=pcm, media_type="audio/pcm")
+
+        if fmt in MP3_FORMATS and width == 2:
+            mp3 = encode_mp3(pcm, rate=rate, channels=channels)
+            if mp3:
+                log.info("Generated %.1f KB of MP3 audio for voice '%s'", len(mp3) / 1024, request.voice)
+                return Response(content=mp3, media_type="audio/mpeg")
+            return Response(
+                content=assemble_wav([pcm], rate=rate, width=width, channels=channels),
+                media_type="audio/wav",
+                headers={"X-Response-Audio-Format": "wav"},
+            )
+
+        if fmt not in ("wav", "wave"):
+            log.warning("response_format '%s' cannot be produced — returning WAV", fmt)
+
+        wav_bytes = assemble_wav([pcm], rate=rate, width=width, channels=channels)
+        log.info("Generated %.1f KB of WAV audio for voice '%s'", len(wav_bytes) / 1024, request.voice)
+        return Response(content=wav_bytes, media_type="audio/wav")
+
+    async def _complete_speech(self, request: SpeechRequest) -> Response:
+        """Generate complete (non-streaming) speech response."""
+        try:
+            async with WyomingStreamClient(
+                self._settings.tts_host, self._settings.tts_port
+            ) as client:
+                voice = await self._resolve_voice(client, request.voice)
+                audio_params, audio_data = await client.synthesize_complete(
+                    text=request.input,
+                    voice=voice,
+                    speed=request.speed,
+                )
+        except WyomingConnectionError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+        except WyomingProtocolError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+        return self._audio_response(audio_data, audio_params, request)
 
     async def text_to_speech(self, request: SpeechRequest) -> Response:
         """Convert text to speech via Wyoming protocol."""
@@ -123,38 +225,15 @@ class OpenAIGateway:
             return await self._stream_speech(request)
         return await self._complete_speech(request)
 
-    async def _complete_speech(self, request: SpeechRequest) -> Response:
-        """Generate complete (non-streaming) speech response."""
-        try:
-            async with WyomingStreamClient(
-                self._settings.tts_host, self._settings.tts_port
-            ) as client:
-                audio_params, audio_data = await client.synthesize_complete(
-                    text=request.input,
-                    voice=request.voice,
-                    speed=request.speed,
-                )
-        except WyomingConnectionError as e:
-            raise HTTPException(status_code=503, detail=str(e))
-        except WyomingProtocolError as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-        wav_bytes = assemble_wav(
-            [audio_data],
-            rate=audio_params["rate"],
-            width=audio_params["width"],
-            channels=audio_params["channels"],
-        )
-
-        log.info(
-            "Generated %.1f KB of WAV audio for voice '%s'",
-            len(wav_bytes) / 1024,
-            request.voice,
-        )
-        return Response(content=wav_bytes, media_type="audio/wav")
-
     async def _stream_speech(self, request: SpeechRequest) -> StreamingResponse:
-        """Generate streaming speech response."""
+        """Generate streaming speech response.
+
+        Streaming responses are always WAV: the container is written while the
+        audio is still arriving, so response_format cannot be honoured.
+        """
+        fmt = (request.response_format or "wav").strip().lower()
+        if fmt not in ("wav", "wave"):
+            log.warning("stream=true ignores response_format '%s' — streaming WAV", fmt)
         return StreamingResponse(
             self._generate_audio_stream(request),
             media_type="audio/wav",
@@ -170,9 +249,10 @@ class OpenAIGateway:
                 self._settings.tts_host, self._settings.tts_port
             ) as client:
                 wav_header_sent = False
+                voice = await self._resolve_voice(client, request.voice)
                 async for event in client.synthesize_stream(
                     text=request.input,
-                    voice=request.voice,
+                    voice=voice,
                     speed=request.speed,
                 ):
                     if not wav_header_sent and AudioStart.is_type(event.type):
@@ -216,10 +296,16 @@ class OpenAIGateway:
             is_translation,
         )
 
-        pcm_bytes, rate, width, channels = _pcm_from_upload(file)
+        raw = _read_upload(file)
 
-        if not pcm_bytes:
-            raise HTTPException(status_code=400, detail="No audio data received")
+        try:
+            pcm_bytes, rate, width, channels = decode_to_pcm(
+                raw,
+                ffmpeg_fallback=self._settings.ffmpeg_fallback,
+                source_hint=_filename_suffix(file.filename),
+            )
+        except AudioGenerationError as e:
+            raise HTTPException(status_code=415, detail=str(e)) from e
 
         log.debug(
             "Audio input: %d bytes, %d Hz, %d-bit, %d channels",

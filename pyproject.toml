@@ -33,6 +33,11 @@ test = [
   "httpx>=0.27.0",
   "ruff>=0.6.0",
 ]
+# Wyoming speaks PCM, so WAV is free. MP3 needs an encoder — Open Notebook asks
+# for response_format=mp3, and without this the gateway answers with WAV bytes.
+mp3 = [
+  "lameenc>=1.6.0",
+]
 
 [project.scripts]
 wyoming-openai-gateway = "wyoming_openai_gateway.__main__:main"

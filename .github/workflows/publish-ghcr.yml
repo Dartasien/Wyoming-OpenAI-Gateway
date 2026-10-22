@@ -3,6 +3,13 @@ name: Publish Docker Image
 on:
   release:
     types: [published]
+  # Publish without cutting a release: Actions → Publish Docker Image → Run workflow
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag for the image (e.g. 0.3.0). 'latest' is always pushed too."
+        required: true
+        default: "latest"
 
 permissions:
   contents: read
@@ -19,10 +26,21 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # GHCR requires a lowercase namespace, and the image must belong to whoever
+      # owns this repository — hardcoding an org here breaks every fork.
+      - name: Compute image tags
+        id: tags
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          image="ghcr.io/${owner}/wyoming-openai-gateway"
+          if [ "$version" = "latest" ]; then
+            echo "tags=${image}:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${image}:latest,${image}:${version}" >> "$GITHUB_OUTPUT"
+          fi
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/archmonger/wyoming-openai-gateway:latest
-            ghcr.io/archmonger/wyoming-openai-gateway:${{ github.ref_name }}
+          tags: ${{ steps.tags.outputs.tags }}

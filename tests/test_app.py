@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 import pytest
+from httpx import ASGITransport, AsyncClient
+
+from wyoming_openai_gateway.app import create_app
+from wyoming_openai_gateway.config import Settings
+
+# A port with no Wyoming server behind it, so routes answer without upstream audio.
+_DEAD_PORT = 19999
 
 # Valid WAV: 16-bit mono 16000 Hz, 160 samples (10ms) of silence
 # Total file = 44 header + 320 data = 364 bytes
@@ -150,3 +157,105 @@ async def test_stt_translations_missing_file(client):
         data={"model": "whisper-1"},
     )
     assert response.status_code == 422
+
+
+# ── Model listing and base URLs (Open Notebook integration) ──────────────────
+#
+# Open Notebook's "Test connection" and "Discover Models" both call
+# GET {base_url}/models. A 404 there is what broke the integration, and the body
+# has to be the OpenAI {"object": "list", "data": [...]} shape.
+
+
+@pytest.mark.asyncio
+async def test_models_returns_openai_shape(client):
+    """GET /v1/models lists the gateway's models in OpenAI format."""
+    response = await client.get("/v1/models")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["object"] == "list"
+
+    ids = [model["id"] for model in body["data"]]
+    assert "wyoming-tts" in ids
+    assert "whisper-1" in ids
+    for model in body["data"]:
+        assert model["object"] == "model"
+        assert "created" in model
+        assert "owned_by" in model
+
+
+@pytest.mark.asyncio
+async def test_model_ids_are_classifiable_by_open_notebook(client):
+    """Open Notebook sorts discovered models by name substring: 'tts' / 'whisper'."""
+    body = (await client.get("/v1/models")).json()
+    ids = [model["id"] for model in body["data"]]
+    assert any("tts" in model_id for model_id in ids)
+    assert any("whisper" in model_id for model_id in ids)
+
+
+@pytest.mark.asyncio
+async def test_models_at_every_base_url_form(client):
+    """Bare host, trailing slash and /v1 must all work as an Open Notebook base URL."""
+    for path in ("/models", "/v1/models"):
+        response = await client.get(path)
+        assert response.status_code == 200, path
+
+
+@pytest.mark.asyncio
+async def test_speech_at_root_and_v1(client):
+    """POST /audio/speech is reachable with or without the /v1 prefix."""
+    for path in ("/audio/speech", "/v1/audio/speech"):
+        response = await client.post(path, json={"input": "Hello", "model": "wyoming-tts"})
+        assert response.status_code == 503, path
+
+
+@pytest.mark.asyncio
+async def test_transcriptions_at_root_and_v1(client):
+    """POST /audio/transcriptions is reachable with or without the /v1 prefix."""
+    for path in ("/audio/transcriptions", "/v1/audio/transcriptions"):
+        response = await client.post(path, files={"file": ("t.wav", _WAV_SILENCE, "audio/wav")})
+        assert response.status_code == 503, path
+
+
+@pytest.mark.asyncio
+async def test_voices_alias_path(client):
+    """esperanto asks for GET {base_url}/audio/voices, not just /voices."""
+    for path in ("/audio/voices", "/v1/audio/voices", "/v1/voices", "/voices"):
+        response = await client.get(path)
+        assert response.status_code == 503, path
+
+
+@pytest.mark.asyncio
+async def test_unknown_path_is_404(client):
+    response = await client.get("/nope/models")
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_root_documents_base_urls(client):
+    """GET / tells the user which base URL to paste into Open Notebook."""
+    response = await client.get("/")
+    assert response.status_code == 200
+    assert any(url.endswith("/v1") for url in response.json()["openai_base_urls"])
+
+
+@pytest.mark.asyncio
+async def test_readyz_names_the_unready_service(client):
+    response = await client.get("/readyz")
+    assert response.status_code == 503
+    assert "not ready" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_custom_prefix_still_serves_v1_and_root():
+    """A non-default PREFIX does not remove the /v1 and root routes."""
+    settings = Settings(
+        tts_host="127.0.0.1",
+        tts_port=_DEAD_PORT,
+        stt_host="127.0.0.1",
+        stt_port=_DEAD_PORT,
+        prefix="api",
+    )
+    async with AsyncClient(transport=ASGITransport(app=create_app(settings)), base_url="http://test") as ac:
+        for path in ("/api/models", "/v1/models", "/models"):
+            response = await ac.get(path)
+            assert response.status_code == 200, path

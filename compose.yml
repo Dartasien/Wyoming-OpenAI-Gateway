@@ -6,8 +6,14 @@ services:
     ports:
       - "8555:8555"
     environment:
+      # Wyoming servers must be reachable from inside this container: use a
+      # compose service name, a LAN address, or host.docker.internal — 127.0.0.1
+      # here means this container, not the host.
       - TTS_HOST=${TTS_HOST:-127.0.0.1}
       - TTS_PORT=${TTS_PORT:-10205}
+      # STT is optional, but Open Notebook needs it for transcription/podcasts:
+      # - STT_HOST=${STT_HOST:-127.0.0.1}
+      # - STT_PORT=${STT_PORT:-10300}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - DEBUG=${DEBUG:-false}
     healthcheck:

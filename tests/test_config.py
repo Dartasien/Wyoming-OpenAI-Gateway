@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from wyoming_openai_gateway.config import Settings, validate
+from wyoming_openai_gateway.config import (
+    Settings,
+    normalize_prefix,
+    openai_base_urls,
+    route_prefixes,
+    validate,
+)
 
 
 def test_defaults():
@@ -100,3 +106,53 @@ def test_validate_ok_both():
     """Validate succeeds with both TTS and STT configured."""
     settings = Settings(tts_host="10.0.0.1", tts_port=10200, stt_host="10.0.0.2", stt_port=10300)
     assert validate(settings) == []
+
+
+def test_prefix_normalisation():
+    """PREFIX is normalised to a leading slash with no trailing slash."""
+    for raw, expected in (
+        ("/v1", "/v1"),
+        ("v1", "/v1"),
+        ("/v1/", "/v1"),
+        ("", ""),
+        ("/", ""),
+        ("/api/v1/", "/api/v1"),
+    ):
+        assert Settings.from_env({"PREFIX": raw}).prefix == expected
+
+
+def test_voice_fallback_default_true():
+    """VOICE_FALLBACK defaults on, and accepts the usual truthy spellings."""
+    assert Settings().voice_fallback is True
+    assert Settings.from_env({}).voice_fallback is True
+    for raw in ("false", "False", "0", "no", ""):
+        assert Settings.from_env({"VOICE_FALLBACK": raw}).voice_fallback is False
+    for raw in ("true", "TRUE", "1", "yes"):
+        assert Settings.from_env({"VOICE_FALLBACK": raw}).voice_fallback is True
+
+
+def test_ffmpeg_fallback_default_true():
+    """FFMPEG_FALLBACK defaults on and can be disabled."""
+    assert Settings().ffmpeg_fallback is True
+    assert Settings.from_env({"FFMPEG_FALLBACK": "false"}).ffmpeg_fallback is False
+
+
+def test_normalize_prefix():
+    assert normalize_prefix("/v1") == "/v1"
+    assert normalize_prefix("v1/") == "/v1"
+    assert normalize_prefix("/") == ""
+    assert normalize_prefix(None) == ""
+
+
+def test_route_prefixes_covers_v1_and_root():
+    """A custom PREFIX still answers on /v1 and on the root path."""
+    assert route_prefixes("/api") == ("/api", "/v1", "")
+    assert route_prefixes("/v1") == ("/v1", "")
+    assert route_prefixes("") == ("", "/v1")
+    assert route_prefixes("/api/v1") == ("/api/v1", "/v1", "")
+
+
+def test_openai_base_urls():
+    urls = openai_base_urls("0.0.0.0", 8555, route_prefixes("/v1"))
+    assert "http://localhost:8555/v1" in urls
+    assert "http://localhost:8555" in urls
